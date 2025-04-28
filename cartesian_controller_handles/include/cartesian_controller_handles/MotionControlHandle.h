@@ -29,7 +29,7 @@
 ////////////////////////////////////////////////////////////////////////////////
 
 //-----------------------------------------------------------------------------
-/*!\file    motion_control_handle.h
+/*!\file    MotionControlHandle.h
  *
  * \author  Stefan Scherzinger <scherzin@fzi.de>
  * \date    2017/11/06
@@ -40,24 +40,25 @@
 #ifndef MOTION_CONTROL_HANDLE_H_INCLUDED
 #define MOTION_CONTROL_HANDLE_H_INCLUDED
 
-#include <controller_interface/controller_interface.hpp>
-#include <geometry_msgs/msg/pose_stamped.hpp>
-#include <hardware_interface/loaned_state_interface.hpp>
-#include <interactive_markers/interactive_marker_server.hpp>
+// ROS
+#include <ros/ros.h>
+#include <interactive_markers/interactive_marker_server.h>
+#include <geometry_msgs/PoseStamped.h>
+
+// ros_controls
+#include <controller_interface/controller.h>
+#include <hardware_interface/joint_state_interface.h>
+
+// Other
+#include <memory>
+
+// KDL
 #include <kdl/chain.hpp>
 #include <kdl/chainfksolverpos_recursive.hpp>
-#include <memory>
-#include <rclcpp/rclcpp.hpp>
-
-#include "cartesian_controller_base/ROS2VersionConfig.h"
-#include "geometry_msgs/msg/detail/pose_stamped__struct.hpp"
-#include "geometry_msgs/msg/pose_stamped.hpp"
-#include "rclcpp/publisher.hpp"
-#include "visualization_msgs/msg/interactive_marker.hpp"
-#include "visualization_msgs/msg/interactive_marker_feedback.hpp"
 
 namespace cartesian_controller_handles
 {
+
 /**
  * @brief Implements a drag-and-drop control handle in RViz
  *
@@ -68,50 +69,46 @@ namespace cartesian_controller_handles
  * geometry_msgs/PoseStamped, which can be followed by motion-based Cartesian
  * controllers, such as the \ref CartesianMotionController or the \ref
  * CartesianComplianceController.
+ *
+ * @tparam HardwareInterface Currently only JointStateInterface is supported
  */
-class MotionControlHandle : public controller_interface::ControllerInterface
+template <class HardwareInterface>
+class MotionControlHandle : public controller_interface::Controller<HardwareInterface>
 {
-public:
-  MotionControlHandle();
-  ~MotionControlHandle();
+  public:
+    MotionControlHandle();
+    ~MotionControlHandle();
 
-  virtual LifecycleNodeInterface::CallbackReturn on_init() override;
+    bool init(HardwareInterface* hw, ros::NodeHandle& nh);
 
-  rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn on_configure(
-    const rclcpp_lifecycle::State & previous_state) override;
+    void starting(const ros::Time& time);
 
-  rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn on_activate(
-    const rclcpp_lifecycle::State & previous_state) override;
+    void stopping(const ros::Time& time);
 
-  rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn on_deactivate(
-    const rclcpp_lifecycle::State & previous_state) override;
+    /**
+     * @brief Publish pose of the control handle as PoseStamped
+     *
+     */
+    void update(const ros::Time& time, const ros::Duration& period);
 
-  controller_interface::InterfaceConfiguration command_interface_configuration() const override;
-  controller_interface::InterfaceConfiguration state_interface_configuration() const override;
-
-  controller_interface::return_type update(const rclcpp::Time & time,
-                                           const rclcpp::Duration & period) override;
-
-private:
-  /**
+  private:
+    /**
      * @brief Move visual marker in RViz according to user interaction
      *
      * This function also stores the marker pose internally.
      *
      * @param feedback The message containing the current pose of the marker
      */
-  void updateMotionControlCallback(
-    const visualization_msgs::msg::InteractiveMarkerFeedback::ConstSharedPtr & feedback);
+    void updateMotionControlCallback(const visualization_msgs::InteractiveMarkerFeedbackConstPtr& feedback);
 
-  /**
+    /**
      * @brief React to changes in the interactive marker menu
      *
      * @param feedback The message containing the current menu configuration
      */
-  void updateMarkerMenuCallback(
-    const visualization_msgs::msg::InteractiveMarkerFeedback::ConstSharedPtr & feedback);
+    void updateMarkerMenuCallback(const visualization_msgs::InteractiveMarkerFeedbackConstPtr& feedback);
 
-  /**
+    /**
      * @brief Add all relevant marker controls for interaction in RViz
      *
      * You must call \a applyChanges() on the marker server for the controls to
@@ -119,9 +116,9 @@ private:
      *
      * @param marker The marker to add the controls to
      */
-  static void prepareMarkerControls(visualization_msgs::msg::InteractiveMarker & marker);
+    void prepareMarkerControls(visualization_msgs::InteractiveMarker& marker);
 
-  /**
+    /**
      * @brief Adds interactive controls (arrows) to a marker.
      *
      * Both move and rotate controls are added along the specified
@@ -132,46 +129,49 @@ private:
      * @param y Y-axis component
      * @param z Z-axis component
      */
-  static void addAxisControl(visualization_msgs::msg::InteractiveMarker & marker, double x,
-                             double y, double z);
+    void addAxisControl(visualization_msgs::InteractiveMarker& marker, double x, double y, double z);
 
-  /**
+    /**
      * @brief Add a sphere visualization to the interactive marker
      *
      * @param marker The marker to add the visualization to
      * @param scale The scale of the visualization. Bounding box in meter.
      */
-  static void addMarkerVisualization(visualization_msgs::msg::InteractiveMarker & marker,
-                                     double scale);
+    void addMarkerVisualization(visualization_msgs::InteractiveMarker& marker, double scale);
 
-  /**
+    /**
      * @brief Get the current pose of the specified end-effector
      *
      * @return The current end-effector pose with respect to the specified base link
      */
-  geometry_msgs::msg::PoseStamped getEndEffectorPose();
+    geometry_msgs::PoseStamped getEndEffectorPose();
 
-  // Handles to the joints
-  std::vector<std::reference_wrapper<hardware_interface::LoanedStateInterface>> m_joint_handles;
+    // Handles to the joints
+    std::vector<
+      hardware_interface::JointStateHandle>   m_joint_handles;
+    std::vector<std::string>  m_joint_names;
 
-  std::vector<std::string> m_joint_names;
+    // Kinematics
+    std::string   m_robot_base_link;
+    std::string   m_end_effector_link;
+    std::string   m_target_frame_topic;
+    KDL::Chain    m_robot_chain;
+    std::shared_ptr<
+      KDL::ChainFkSolverPos_recursive>  m_fk_solver;
 
-  // Kinematics
-  std::string m_robot_base_link;
-  std::string m_end_effector_link;
-  std::string m_target_frame_topic;
-  KDL::Chain m_robot_chain;
-  std::shared_ptr<KDL::ChainFkSolverPos_recursive> m_fk_solver;
+    geometry_msgs::PoseStamped  m_current_pose;
+    ros::Publisher  m_pose_publisher;
 
-  geometry_msgs::msg::PoseStamped m_current_pose;
-  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr m_pose_publisher;
+    // Interactive marker
+    std::shared_ptr<
+      interactive_markers::InteractiveMarkerServer> m_server;
 
-  // Interactive marker
-  std::shared_ptr<interactive_markers::InteractiveMarkerServer> m_server;
+    visualization_msgs::InteractiveMarker           m_marker; //!< Controller handle for RViz
 
-  visualization_msgs::msg::InteractiveMarker m_marker;  //!< Controller handle for RViz
 };
 
-}  // namespace cartesian_controller_handles
+} // cartesian_controller_handles
+
+#include <cartesian_controller_handles/MotionControlHandle.hpp>
 
 #endif
