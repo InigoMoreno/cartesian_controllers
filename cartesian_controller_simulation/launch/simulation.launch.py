@@ -116,10 +116,7 @@ def generate_launch_description():
         )
 
     # Active controllers
-    active_list = [
-        "joint_state_broadcaster",
-        "joint_to_cartesian_controller"
-    ]
+    active_list = ["joint_state_broadcaster", "joint_to_cartesian_controller"]
     active_spawners = [controller_spawner(controller) for controller in active_list]
 
     # Inactive controllers
