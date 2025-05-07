@@ -1,223 +1,301 @@
-////////////////////////////////////////////////////////////////////////////////
-// Copyright 2019 FZI Research Center for Information Technology
+// Copyright (c) 2023, PAL Robotics
 //
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// 1. Redistributions of source code must retain the above copyright notice,
-// this list of conditions and the following disclaimer.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution.
-//
-// 3. Neither the name of the copyright holder nor the names of its
-// contributors may be used to endorse or promote products derived from this
-// software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-// POSSIBILITY OF SUCH DAMAGE.
-////////////////////////////////////////////////////////////////////////////////
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-//-----------------------------------------------------------------------------
-/*!\file    joint_to_cartesian_controller.cpp
- *
- * \author  Stefan Scherzinger <scherzin@fzi.de>
- * \date    2017/08/15
- *
- */
-//-----------------------------------------------------------------------------
+#include "joint_to_cartesian_controller/joint_to_cartesian_controller.h"
 
-#include "ros/duration.h"
-#include "ros/rate.h"
-#include <cartesian_controller_base/Utility.h>
-#include <joint_to_cartesian_controller/joint_to_cartesian_controller.h>
-#include <kdl/tree.hpp>
-#include <kdl_parser/kdl_parser.hpp>
-#include <memory>
-#include <pluginlib/class_list_macros.h>
 #include <urdf/model.h>
 
-namespace cartesian_controllers
-{
-  /**
-   * @brief Connect joint-based controllers and transform their commands to Cartesian target poses
-   *
-   * This controller handles an internal controller manager, which can load
-   * standard ros_controllers. The control commands from these controllers are
-   * turned into Cartesian poses with forward kinematics, and can be used by
-   * the Cartesian_controllers. An application of this controller is to
-   * provide an easy interface to the rqt_joint_trajectory_controller plugin and
-   * MoveIt!.
-   */
-  typedef joint_to_cartesian_controller::JointToCartesianController JointControllerAdapter;
-}
+#include <kdl/tree.hpp>
+#include <kdl_parser/kdl_parser.hpp>
 
-PLUGINLIB_EXPORT_CLASS(cartesian_controllers::JointControllerAdapter, controller_interface::ControllerBase)
-
-
-
-
-
+#include "controller_interface/helpers.hpp"
+#include "geometry_msgs/msg/pose_stamped.hpp"
+#include "pluginlib/class_list_macros.hpp"
 
 namespace joint_to_cartesian_controller
 {
 
-JointToCartesianController::JointToCartesianController()
+controller_interface::CallbackReturn JointToCartesianController::on_init()
 {
+  try
+  {
+    auto_declare<std::string>("robot_description", "");
+    auto_declare<std::string>("robot_base_link", "");
+    auto_declare<std::string>("end_effector_link", "");
+    auto_declare<std::vector<std::string>>("interfaces", std::vector<std::string>());
+  }
+  catch (const std::exception & e)
+  {
+    fprintf(stderr, "Exception thrown during init stage with message: %s \n", e.what());
+    return controller_interface::CallbackReturn::ERROR;
+  }
+  return controller_interface::CallbackReturn::SUCCESS;
 }
 
-bool JointToCartesianController::init(hardware_interface::JointStateInterface* hw, ros::NodeHandle& nh)
+controller_interface::InterfaceConfiguration
+JointToCartesianController::command_interface_configuration() const
 {
-  std::string robot_description;
-  urdf::Model robot_model;
-  KDL::Tree   robot_tree;
+  return controller_interface::InterfaceConfiguration{
+    controller_interface::interface_configuration_type::NONE};
+}
 
-  // Get controller specific configuration
-  if (!nh.getParam("/robot_description",robot_description))
+controller_interface::InterfaceConfiguration
+JointToCartesianController::state_interface_configuration() const
+{
+  controller_interface::InterfaceConfiguration state_interfaces_config;
+  state_interfaces_config.type = controller_interface::interface_configuration_type::INDIVIDUAL;
+  state_interfaces_config.names = command_interface_names_;
+
+  return state_interfaces_config;
+}
+
+controller_interface::CallbackReturn JointToCartesianController::on_configure(
+  const rclcpp_lifecycle::State & /*previous_state*/)
+{
+  command_interface_names_ = get_node()->get_parameter("interfaces").as_string_array();
+
+  joints_cmd_sub_ = this->get_node()->create_subscription<DataType>(
+    "~/commands", rclcpp::SystemDefaultsQoS(),
+    [this](const DataType::SharedPtr msg)
+    {
+      // check if message is correct size, if not ignore
+      if (msg->data.size() == command_interface_names_.size())
+      {
+        rt_buffer_ptr_.writeFromNonRT(msg);
+      }
+      else
+      {
+        RCLCPP_ERROR(this->get_node()->get_logger(),
+                     "Invalid command received of %zu size, expected %zu size", msg->data.size(),
+                     command_interface_names_.size());
+      }
+    });
+
+  // pre-reserve command interfaces
+  command_interfaces_.reserve(command_interface_names_.size());
+
+  urdf::Model robot_model;
+  KDL::Tree robot_tree;
+
+#if defined CARTESIAN_CONTROLLERS_JAZZY
+  std::string robot_description = this->get_robot_description();
+#else
+  std::string robot_description = get_node()->get_parameter("robot_description").as_string();
+#endif
+  if (robot_description.empty())
   {
-    ROS_ERROR("Failed to load '/robot_description' from parameter server");
-    return false;
+    RCLCPP_ERROR(get_node()->get_logger(), "robot_description is empty");
+    return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::ERROR;
   }
-  if (!nh.getParam("robot_base_link",m_robot_base_link))
+  m_robot_base_link = get_node()->get_parameter("robot_base_link").as_string();
+  if (m_robot_base_link.empty())
   {
-    ROS_ERROR_STREAM("Failed to load " << nh.getNamespace() + "/robot_base_link" << " from parameter server");
-    return false;
+    RCLCPP_ERROR(get_node()->get_logger(), "robot_base_link is empty");
+    return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::ERROR;
   }
-  if (!nh.getParam("end_effector_link",m_end_effector_link))
+  m_end_effector_link = get_node()->get_parameter("end_effector_link").as_string();
+  if (m_end_effector_link.empty())
   {
-    ROS_ERROR_STREAM("Failed to load " << nh.getNamespace() + "/end_effector_link" << " from parameter server");
-    return false;
-  }
-  if (!nh.getParam("target_frame_topic",m_target_frame_topic))
-  {
-    m_target_frame_topic = "target_frame";
-    ROS_WARN_STREAM("Failed to load "
-        << nh.getNamespace() + "/target_frame_topic"
-        << " from parameter server. "
-        << "Will default to: "
-        << nh.getNamespace() + m_target_frame_topic);
+    RCLCPP_ERROR(get_node()->get_logger(), "end_effector_link is empty");
+    return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::ERROR;
   }
 
   // Publishers
-  m_pose_publisher = nh.advertise<geometry_msgs::PoseStamped>(m_target_frame_topic,10);
+  m_pose_publisher = get_node()->create_publisher<geometry_msgs::msg::PoseStamped>(
+    get_node()->get_name() + std::string("/target_frame"), 10);
 
   // Build a kinematic chain of the robot
   if (!robot_model.initString(robot_description))
   {
-    ROS_ERROR("Failed to parse urdf model from 'robot_description'");
-    return false;
+    RCLCPP_ERROR(get_node()->get_logger(), "Failed to parse urdf model from 'robot_description'");
+    return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::ERROR;
   }
-  if (!kdl_parser::treeFromUrdfModel(robot_model,robot_tree))
+  if (!kdl_parser::treeFromUrdfModel(robot_model, robot_tree))
   {
-    const std::string error = ""
-      "Failed to parse KDL tree from urdf model";
-    ROS_ERROR_STREAM(error);
-    throw std::runtime_error(error);
+    RCLCPP_ERROR(get_node()->get_logger(), "Failed to parse KDL tree from urdf model");
+    return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::ERROR;
   }
-  if (!robot_tree.getChain(m_robot_base_link,m_end_effector_link, m_robot_chain))
+  if (!robot_tree.getChain(m_robot_base_link, m_end_effector_link, m_robot_chain))
   {
-    const std::string error = ""
+    const std::string error =
+      ""
       "Failed to parse robot chain from urdf model. "
-      "Are you sure that both your 'robot_base_link' and 'end_effector_link' exist?";
-    ROS_ERROR_STREAM(error);
-    throw std::runtime_error(error);
+      "Do robot_base_link and end_effector_link exist?";
+    RCLCPP_ERROR(get_node()->get_logger(), "%s", error.c_str());
+    return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::ERROR;
   }
 
-  // Get names of controllable joints from the parameter server
-  if (!nh.getParam("joints",m_joint_names))
-  {
-    const std::string error = ""
-    "Failed to load " + nh.getNamespace() + "/joints" + " from parameter server";
-    ROS_ERROR_STREAM(error);
-    throw std::runtime_error(error);
-  }
+  RCLCPP_INFO(this->get_node()->get_logger(), "configure successful");
 
-  // Get the joint handles to use in the control loop
-  for (size_t i = 0; i < m_joint_names.size(); ++i)
-  {
-    m_joint_state_handles.push_back(hw->getHandle(m_joint_names[i]));
-  }
-
-  // Adjust joint buffers
-  m_positions.data = ctrl::VectorND::Zero(m_joint_state_handles.size());
-  m_velocities.data = ctrl::VectorND::Zero(m_joint_state_handles.size());
-
-  // Initialize controller adapter and according manager
-  m_controller_adapter = std::make_unique<JointControllerAdapter>(m_joint_state_handles,nh);
-  m_controller_manager.reset(new controller_manager::ControllerManager(m_controller_adapter.get(), nh));
-
-  // Process adapter callbacks even when we are not running.
-  // This allows to interact with the adapter's controller manager without
-  // freezes.  We use an idealized update rate since we republish joint
-  // commands as Cartesian targets. The cartesian_controllers will interpolate
-  // these targets for the robot driver's real control rate.
-  m_adapter_thread = std::thread([this] {
-    constexpr int frequency = 100;
-    auto rate               = ros::Rate(frequency);
-    ros::AsyncSpinner spinner(2);
-    spinner.start();
-    while (ros::ok())
-    {
-      m_controller_adapter->read();
-      m_controller_manager->update(ros::Time::now(), rate.expectedCycleTime());
-      if (m_mutex.try_lock())
-      {
-        m_controller_adapter->write(m_positions);
-        m_mutex.unlock();
-      }
-      rate.sleep();
-    }
-    spinner.stop();
-  });
-  m_adapter_thread.detach();  // gracefully die when our node shuts down.
-
-  // Initialize forward kinematics solver
+  // Initialize kinematics
   m_fk_solver.reset(new KDL::ChainFkSolverPos_recursive(m_robot_chain));
 
-  return true;
+  // The names should be in the same order as for command interfaces for easier matching
+  reference_interface_names_ = command_interface_names_;
+  exported_state_interface_names_ = command_interface_names_;
+  // for any case make reference interfaces size of command interfaces
+  reference_interfaces_.resize(reference_interface_names_.size(),
+                               std::numeric_limits<double>::quiet_NaN());
+
+  return controller_interface::CallbackReturn::SUCCESS;
 }
 
-void JointToCartesianController::starting(const ros::Time& time)
+controller_interface::CallbackReturn JointToCartesianController::on_activate(
+  const rclcpp_lifecycle::State & /*previous_state*/)
 {
-}
+  //  check if we have all resources defined in the "points" parameter
+  //  also verify that we *only* have the resources defined in the "points" parameter
+  // ATTENTION(destogl): Shouldn't we use ordered interface all the time?
+  // std::vector<std::reference_wrapper<hardware_interface::LoanedCommandInterface>>
+  //   ordered_interfaces;
+  // if (
+  //   !controller_interface::get_ordered_interfaces(
+  //     command_interfaces_, command_interface_names_, std::string(""), ordered_interfaces) ||
+  //   command_interface_names_.size() != ordered_interfaces.size())
+  // {
+  //   RCLCPP_ERROR(
+  //     this->get_node()->get_logger(), "Expected %zu command interfaces, got %zu",
+  //     command_interface_names_.size(), ordered_interfaces.size());
+  //   return controller_interface::CallbackReturn::ERROR;
+  // }
 
-void JointToCartesianController::stopping(const ros::Time& time)
-{
-}
-
-void JointToCartesianController::update(const ros::Time& time, const ros::Duration& period)
-{
-  if (m_mutex.try_lock())
+  std::vector<std::reference_wrapper<hardware_interface::LoanedStateInterface>> state_interfaces;
+  if (!controller_interface::get_ordered_interfaces(state_interfaces_, command_interface_names_,
+                                                    std::string(""), state_interfaces) ||
+      command_interface_names_.size() != state_interfaces.size())
   {
-    // Solve forward kinematics
-    KDL::Frame frame;
-    m_fk_solver->JntToCart(m_positions,frame);
-
-    // Publish end-effector pose
-    geometry_msgs::PoseStamped target_pose = geometry_msgs::PoseStamped();
-    target_pose.header.stamp = ros::Time::now();
-    target_pose.header.frame_id = m_robot_base_link;
-    target_pose.pose.position.x = frame.p.x();
-    target_pose.pose.position.y = frame.p.y();
-    target_pose.pose.position.z = frame.p.z();
-    frame.M.GetQuaternion(
-        target_pose.pose.orientation.x,
-        target_pose.pose.orientation.y,
-        target_pose.pose.orientation.z,
-        target_pose.pose.orientation.w);
-    m_pose_publisher.publish(target_pose);
-    m_mutex.unlock();
+    RCLCPP_ERROR(this->get_node()->get_logger(), "Expected %zu state interfaces, got %zu",
+                 command_interface_names_.size(), state_interfaces.size());
+    return controller_interface::CallbackReturn::ERROR;
   }
+
+  // reset command buffer if a command came through callback when controller was inactive
+  rt_buffer_ptr_ = realtime_tools::RealtimeBuffer<std::shared_ptr<DataType>>(nullptr);
+
+  RCLCPP_INFO(this->get_node()->get_logger(), "activate successful");
+
+  std::fill(reference_interfaces_.begin(), reference_interfaces_.end(),
+            std::numeric_limits<double>::quiet_NaN());
+
+  return controller_interface::CallbackReturn::SUCCESS;
 }
 
+controller_interface::CallbackReturn JointToCartesianController::on_deactivate(
+  const rclcpp_lifecycle::State & /*previous_state*/)
+{
+  // reset command buffer
+  rt_buffer_ptr_ = realtime_tools::RealtimeBuffer<std::shared_ptr<DataType>>(nullptr);
+  return controller_interface::CallbackReturn::SUCCESS;
 }
+
+bool JointToCartesianController::on_set_chained_mode(bool /*chained_mode*/) { return true; }
+
+controller_interface::return_type JointToCartesianController::update_and_write_commands(
+  const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
+{
+  KDL::JntArray positions(reference_interfaces_.size());
+
+  for (size_t i = 0; i < reference_interfaces_.size(); ++i)
+  {
+    if (!std::isnan(reference_interfaces_[i]))
+    {
+      // command_interfaces_[i].set_value(reference_interfaces_[i]);
+      positions(i) = reference_interfaces_[i];
+    }
+    else
+    {
+      auto optional = state_interfaces_[i].get_optional();
+      if (optional)
+      {
+        positions(i) = optional.value();
+      }
+    }
+    bool success = ordered_exported_state_interfaces_[i]->set_value(positions(i));
+    if (!success)
+    {
+      RCLCPP_ERROR_STREAM(get_node()->get_logger(),
+                          "Failed to set value for state interface %s"
+                            << ordered_exported_state_interfaces_[i]->get_name());
+      return controller_interface::return_type::ERROR;
+    }
+  }
+
+  KDL::Frame tmp;
+  m_fk_solver->JntToCart(positions, tmp);
+
+  m_current_pose.pose.position.x = tmp.p.x();
+  m_current_pose.pose.position.y = tmp.p.y();
+  m_current_pose.pose.position.z = tmp.p.z();
+  tmp.M.GetQuaternion(m_current_pose.pose.orientation.x, m_current_pose.pose.orientation.y,
+                      m_current_pose.pose.orientation.z, m_current_pose.pose.orientation.w);
+
+  m_current_pose.header.stamp = get_node()->now();
+  m_current_pose.header.frame_id = m_robot_base_link;
+  m_pose_publisher->publish(m_current_pose);
+
+  return controller_interface::return_type::OK;
+}
+
+std::vector<hardware_interface::StateInterface>
+JointToCartesianController::on_export_state_interfaces()
+{
+  state_interfaces_values_.resize(exported_state_interface_names_.size(), 0.0);
+  std::vector<hardware_interface::StateInterface> state_interfaces;
+  for (size_t i = 0; i < exported_state_interface_names_.size(); ++i)
+  {
+    state_interfaces.emplace_back(hardware_interface::StateInterface(
+      get_node()->get_name(), exported_state_interface_names_[i], &state_interfaces_values_[i]));
+  }
+  return state_interfaces;
+}
+
+std::vector<hardware_interface::CommandInterface>
+JointToCartesianController::on_export_reference_interfaces()
+{
+  std::vector<hardware_interface::CommandInterface> reference_interfaces;
+
+  for (size_t i = 0; i < reference_interface_names_.size(); ++i)
+  {
+    reference_interfaces.push_back(hardware_interface::CommandInterface(
+      get_node()->get_name(), reference_interface_names_[i], &reference_interfaces_[i]));
+  }
+
+  return reference_interfaces;
+}
+
+controller_interface::return_type JointToCartesianController::update_reference_from_subscribers(
+  const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
+{
+  auto joint_commands = rt_buffer_ptr_.readFromRT();
+  // message is valid
+  if (!(!joint_commands || !(*joint_commands)))
+  {
+    if (reference_interfaces_.size() != (*joint_commands)->data.size())
+    {
+      RCLCPP_ERROR_THROTTLE(
+        get_node()->get_logger(), *(get_node()->get_clock()), 1000,
+        "command size (%zu) does not match number of reference interfaces (%zu)",
+        (*joint_commands)->data.size(), reference_interfaces_.size());
+      return controller_interface::return_type::ERROR;
+    }
+    reference_interfaces_ = (*joint_commands)->data;
+  }
+
+  return controller_interface::return_type::OK;
+}
+
+}  // namespace joint_to_cartesian_controller
+
+PLUGINLIB_EXPORT_CLASS(joint_to_cartesian_controller::JointToCartesianController,
+                       controller_interface::ChainableControllerInterface)

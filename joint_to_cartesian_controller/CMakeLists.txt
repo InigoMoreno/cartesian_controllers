@@ -40,7 +40,6 @@ ament_export_dependencies(
 
 add_library(${PROJECT_NAME} SHARED
   src/joint_to_cartesian_controller.cpp
-  src/JointControllerAdapter.cpp
 )
 
 target_include_directories(${PROJECT_NAME}
